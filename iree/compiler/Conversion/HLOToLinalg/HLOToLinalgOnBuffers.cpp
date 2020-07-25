@@ -384,9 +384,96 @@ LogicalResult ConvOpConversion::apply(
     rewriter.notifyMatchFailure(op, "failed to zero fill result buffer");
     return failure();
   }
-  rewriter.create<linalg::ConvOp>(op.getLoc(), inputBuffers[1], inputBuffers[0],
-                                  resultBuffers[0], stridesArg, dilationArg,
-                                  padding);
+  // Depthwise conv path...
+  if (op.feature_group_count().getZExtValue() > 1u &&
+      op.feature_group_count().getZExtValue() ==
+          op.dimension_numbers().kernel_input_feature_dimension().getInt()) {
+    // Lowering depthwise convolution to linalg.generic op. The idea is to use
+    // the group convolution formulation to perform the separable depth wise
+    // convolution as the following, given an n-dimensional input x and filter w
+    // the direct convolution operation can be written as:
+    //  y[n, d1, d2, ....dn, ci * groupSize + co] = sum(k1, k2, ....kn,
+    // x[n, d1 * stride1 + k1, d1 * stride2 + k2, ...dn * striden + kn]
+    // * w[k1, k2, ...kn, ci, co])
+    SmallVector<AffineExpr, 4> inputExprs;
+    SmallVector<AffineExpr, 4> filterExprs;
+    SmallVector<AffineExpr, 4> outputExprs;
+
+    const auto spatialDims =
+        llvm::size(op.dimension_numbers().input_spatial_dimensions());
+    const int d1Index = 1;
+    const int coIndex = d1Index + spatialDims;
+    const int ciIndex = coIndex + 1;
+    const int k1Index = ciIndex + 1;
+    // n
+    inputExprs.push_back(rewriter.getAffineDimExpr(0));
+    // d1, d2....dn
+    for (int i = 0; i < spatialDims; ++i) {
+      if (op.window_stridesAttr()) {
+        auto stride = op.window_stridesAttr().getValue<APInt>(i);
+        inputExprs.push_back(rewriter.getAffineDimExpr(d1Index + i) *
+                                 stride.getZExtValue() +
+                             rewriter.getAffineDimExpr(k1Index + i));
+      } else {
+        inputExprs.push_back(rewriter.getAffineDimExpr(d1Index + i) +
+                             rewriter.getAffineDimExpr(k1Index + i));
+      }
+    }
+    // ci
+    inputExprs.push_back(rewriter.getAffineDimExpr(ciIndex));
+    // k1, k2,...kn
+    for (int i = 0; i < spatialDims; ++i) {
+      filterExprs.push_back(rewriter.getAffineDimExpr(k1Index + i));
+    }
+    // ci, co
+    filterExprs.push_back(rewriter.getAffineDimExpr(ciIndex));
+    filterExprs.push_back(rewriter.getAffineDimExpr(coIndex));
+
+    // n
+    outputExprs.push_back(rewriter.getAffineDimExpr(0));
+    for (int i = 0; i < spatialDims; ++i) {
+      outputExprs.push_back(rewriter.getAffineDimExpr(d1Index + i));
+    }
+    // ci * groupSize + co
+    outputExprs.push_back(
+        rewriter.getAffineDimExpr(ciIndex) *
+            op.dimension_numbers().kernel_output_feature_dimension().getInt() +
+        rewriter.getAffineDimExpr(coIndex));
+
+    // nloops = |d| + |k| + 3
+    int nloops = spatialDims * 2 + 3;
+    SmallVector<AffineMap, 4> indexingMaps;
+    indexingMaps.emplace_back(AffineMap::get(
+        nloops, /*symbolCount=*/0, inputExprs, rewriter.getContext()));
+    indexingMaps.emplace_back(AffineMap::get(
+        nloops, /*symbolCount=*/0, filterExprs, rewriter.getContext()));
+    indexingMaps.emplace_back(AffineMap::get(
+        nloops, /*symbolCount=*/0, outputExprs, rewriter.getContext()));
+
+    Location loc = op.getLoc();
+    SmallVector<Type, 4> bodyArgTypes, opResultTypes;
+    SmallVector<Value, 2> linalgOpArgs = {inputBuffers[0], inputBuffers[1],
+                                          resultBuffers[0]};
+
+    SmallVector<StringRef, 3> parallelLoopsNum(spatialDims + 3, "parallel");
+    for (int i = 0; i < spatialDims; ++i) {
+      parallelLoopsNum.push_back("reduction");
+    }
+    rewriter.create<linalg::GenericOp>(
+        loc, opResultTypes, linalgOpArgs,
+        2,  // args_in
+        1,  // args_out
+        indexingMaps, parallelLoopsNum,
+        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+          Value mul = nestedBuilder.create<MulFOp>(nestedLoc, args[0], args[1]);
+          Value add = nestedBuilder.create<AddFOp>(nestedLoc, mul, args[2]);
+          nestedBuilder.create<linalg::YieldOp>(loc, add);
+        });
+  } else {
+    rewriter.create<linalg::ConvOp>(op.getLoc(), inputBuffers[1],
+                                    inputBuffers[0], resultBuffers[0],
+                                    stridesArg, dilationArg, padding);
+  }
   return success();
 }
 

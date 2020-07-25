@@ -38,19 +38,49 @@ class Conv2dModule(tf.Module):
         img, kernel, [1, 1, 1, 1], "SAME", name="result")
 
 
+
+  @tf.function(input_signature=[
+      tf.TensorSpec([2, 4, 5, 2], tf.float32),
+      tf.TensorSpec([2, 4, 2, 3], tf.float32),
+  ])
+  def conv2d_2452x2223_valid_stride_2(self, img, kernel):
+    return tf.nn.depthwise_conv2d(
+        img, kernel, [1, 2, 2, 1], "VALID", name="result")
+
+  @tf.function(input_signature=[
+      tf.TensorSpec([2, 4, 5, 2], tf.float32),
+      tf.TensorSpec([2, 4, 2, 3], tf.float32),
+  ])
+  def conv2d_2452x2223_same_stride_2(self, img, kernel):
+    return tf.nn.depthwise_conv2d(
+        img, kernel, [1, 2, 2, 1], "SAME", name="result")
+
+
 @tf_test_utils.compile_module(Conv2dModule)
 class ConvTest(tf_test_utils.CompiledModuleTestCase):
 
-  def test_batched_feature_unpadded(self):
+  def test_batched_feature_padded(self):
     i = np.arange(80, dtype=np.float32).reshape([2, 4, 5, 2])
     k = np.arange(24, dtype=np.float32).reshape([2, 2, 2, 3])
     r = self.get_module().conv2d_2452x2223_valid(i, k)
     r.print().assert_all_close()
 
-  def test_batched_feature_unpadded_smae(self):
+  def test_batched_feature_unpadded_same(self):
     i = np.arange(80, dtype=np.float32).reshape([2, 4, 5, 2])
     k = np.arange(48, dtype=np.float32).reshape([2, 4, 2, 3])
     r = self.get_module().conv2d_2452x2223_same(i, k)
+    r.print().assert_all_close()
+
+  def test_batched_feature_unpadded_same_stride_2(self):
+    i = np.arange(80, dtype=np.float32).reshape([2, 4, 5, 2])
+    k = np.arange(48, dtype=np.float32).reshape([2, 4, 2, 3])
+    r = self.get_module().conv2d_2452x2223_same_stride_2(i, k)
+    r.print().assert_all_close()
+
+  def test_batched_feature_padded_same_stride_2(self):
+    i = np.arange(80, dtype=np.float32).reshape([2, 4, 5, 2])
+    k = np.arange(48, dtype=np.float32).reshape([2, 4, 2, 3])
+    r = self.get_module().conv2d_2452x2223_valid_stride_2(i, k)
     r.print().assert_all_close()
 
 
