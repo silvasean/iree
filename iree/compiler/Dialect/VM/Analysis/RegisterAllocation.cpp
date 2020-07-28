@@ -50,8 +50,8 @@ LogicalResult RegisterAllocation::annotateIR(IREE::VM::FuncOp funcOp) {
     SmallVector<std::string, 8> blockRegStrs;
     blockRegStrs.reserve(block.getNumArguments());
     for (auto blockArg : block.getArguments()) {
-      uint16_t reg = registerAllocation.map_[blockArg];
-      blockRegStrs.push_back(std::to_string(reg));
+      auto reg = registerAllocation.map_[blockArg];
+      blockRegStrs.push_back(reg.toString());
     }
     block.front().setAttr("block_registers",
                           getStrArrayAttr(builder, blockRegStrs));
@@ -61,8 +61,8 @@ LogicalResult RegisterAllocation::annotateIR(IREE::VM::FuncOp funcOp) {
       SmallVector<std::string, 8> regStrs;
       regStrs.reserve(op.getNumResults());
       for (auto result : op.getResults()) {
-        uint16_t reg = registerAllocation.map_[result];
-        regStrs.push_back(std::to_string(reg));
+        auto reg = registerAllocation.map_[result];
+        regStrs.push_back(reg.toString());
       }
       op.setAttr("result_registers", getStrArrayAttr(builder, regStrs));
     }
@@ -76,9 +76,10 @@ LogicalResult RegisterAllocation::annotateIR(IREE::VM::FuncOp funcOp) {
             registerAllocation.remapSuccessorRegisters(terminatorOp, i);
         SmallVector<std::string, 8> remappingStrs;
         for (auto &srcDstReg : srcDstRegs) {
-          remappingStrs.push_back(
-              llvm::formatv("{0}->{1}", srcDstReg.first, srcDstReg.second)
-                  .str());
+          remappingStrs.push_back(llvm::formatv("{0}->{1}",
+                                                srcDstReg.first.toString(),
+                                                srcDstReg.second.toString())
+                                      .str());
         }
         successorAttrs.push_back(getStrArrayAttr(builder, remappingStrs));
       }
@@ -88,18 +89,6 @@ LogicalResult RegisterAllocation::annotateIR(IREE::VM::FuncOp funcOp) {
   }
 
   return success();
-}
-
-// Forms a register reference byte as interpreted by the VM.
-// Assumes that the ordinal has been constructed in the valid range.
-static uint16_t makeRegisterByte(Type type, int ordinal, bool isMove) {
-  if (type.isSignlessIntOrIndexOrFloat()) {
-    assert(ordinal < kIntRegisterCount);
-    return ordinal;
-  } else {
-    assert(ordinal < kRefRegisterCount);
-    return (ordinal | kRefRegisterTypeBit) | (isMove ? kRefRegisterMoveBit : 0);
-  }
 }
 
 // Bitmaps set indicating which registers of which banks are in use.
@@ -116,29 +105,30 @@ struct RegisterUsage {
     maxRefRegisterOrdinal = -1;
   }
 
-  Optional<uint16_t> allocateRegister(Type type) {
+  Optional<Register> allocateRegister(Type type) {
     if (type.isSignlessIntOrIndexOrFloat()) {
+      // DO NOT SUBMIT find a span that can fit the byte width
       int ordinal = intRegisters.find_first_unset();
       if (ordinal >= kIntRegisterCount) {
-        return {};
+        return llvm::None;
       }
       intRegisters.set(ordinal);
       maxI32RegisterOrdinal = std::max(ordinal, maxI32RegisterOrdinal);
-      return makeRegisterByte(type, ordinal, /*isMove=*/false);
+      return Register::getValue(type, ordinal);
     } else {
       int ordinal = refRegisters.find_first_unset();
       if (ordinal >= kRefRegisterCount) {
-        return {};
+        return llvm::None;
       }
       refRegisters.set(ordinal);
       maxRefRegisterOrdinal = std::max(ordinal, maxRefRegisterOrdinal);
-      return makeRegisterByte(type, ordinal, /*isMove=*/false);
+      return Register::getRef(type, ordinal, /*isMove=*/false);
     }
   }
 
-  void markRegisterUsed(uint16_t reg) {
-    int ordinal = getRegisterOrdinal(reg);
-    if (isRefRegister(reg)) {
+  void markRegisterUsed(Register reg) {
+    int ordinal = reg.ordinal();
+    if (reg.isRef()) {
       refRegisters.set(ordinal);
       maxRefRegisterOrdinal = std::max(ordinal, maxRefRegisterOrdinal);
     } else {
@@ -147,11 +137,12 @@ struct RegisterUsage {
     }
   }
 
-  void releaseRegister(uint16_t reg) {
-    if (isRefRegister(reg)) {
-      refRegisters.reset(reg & kRefRegisterCount);
+  void releaseRegister(Register reg) {
+    int ordinal = reg.ordinal();
+    if (reg.isRef()) {
+      refRegisters.reset(ordinal);
     } else {
-      intRegisters.reset(reg & kIntRegisterCount);
+      intRegisters.reset(ordinal);
     }
   }
 };
@@ -275,18 +266,17 @@ LogicalResult RegisterAllocation::recalculate(IREE::VM::FuncOp funcOp) {
   return success();
 }
 
-uint16_t RegisterAllocation::mapToRegister(Value value) {
+Register RegisterAllocation::mapToRegister(Value value) {
   auto it = map_.find(value);
   assert(it != map_.end());
   return it->getSecond();
 }
 
-uint16_t RegisterAllocation::mapUseToRegister(Value value, Operation *useOp,
+Register RegisterAllocation::mapUseToRegister(Value value, Operation *useOp,
                                               int operandIndex) {
-  uint16_t reg = mapToRegister(value);
-  if (isRefRegister(reg) &&
-      liveness_.isLastValueUse(value, useOp, operandIndex)) {
-    reg |= kRefRegisterMoveBit;
+  auto reg = mapToRegister(value);
+  if (reg.isRef() && liveness_.isLastValueUse(value, useOp, operandIndex)) {
+    reg.setMove(true);
   }
   return reg;
 }
@@ -294,7 +284,7 @@ uint16_t RegisterAllocation::mapUseToRegister(Value value, Operation *useOp,
 // A feedback arc set containing the minimal list of cycle-causing edges.
 // https://en.wikipedia.org/wiki/Feedback_arc_set
 struct FeedbackArcSet {
-  using NodeID = uint16_t;
+  using NodeID = Register;
   using Edge = std::pair<NodeID, NodeID>;
 
   // Edges making up a DAG (inputEdges - feedbackEdges).
@@ -322,8 +312,8 @@ struct FeedbackArcSet {
     SmallVector<FASNode, 8> nodeStorage;
     llvm::SmallDenseMap<NodeID, FASNode *> nodes;
     for (auto &edge : inputEdges) {
-      NodeID sourceID = getBaseRegister(edge.first);
-      NodeID sinkID = getBaseRegister(edge.second);
+      NodeID sourceID = edge.first.asBaseRegister();
+      NodeID sinkID = edge.second.asBaseRegister();
       assert(sourceID != sinkID && "self-cycles not supported");
       if (nodes.count(sourceID) == 0) {
         nodeStorage.push_back({sourceID, 0, 0});
@@ -343,8 +333,8 @@ struct FeedbackArcSet {
     int maxIndegree = 0;
     SmallVector<FASEdge, 8> edges;
     for (auto &edge : inputEdges) {
-      NodeID sourceID = getBaseRegister(edge.first);
-      NodeID sinkID = getBaseRegister(edge.second);
+      NodeID sourceID = edge.first.asBaseRegister();
+      NodeID sinkID = edge.second.asBaseRegister();
       auto *sourceNode = nodes[sourceID];
       ++sourceNode->outdegree;
       maxOutdegree = std::max(maxOutdegree, sourceNode->outdegree);
@@ -424,7 +414,7 @@ struct FeedbackArcSet {
         removeNode(node);
       }
       if (nodes.empty()) break;
-      for (int i = buckets.size() - 1; i >= 0; --i) {
+      for (ssize_t i = buckets.size() - 1; i >= 0; --i) {
         if (buckets[i].empty()) continue;
         auto *bucket = buckets[i].front();
         buckets[i].erase(buckets[i].begin());
@@ -439,16 +429,15 @@ struct FeedbackArcSet {
     llvm::SmallSetVector<NodeID, 8> acyclicNodes;
     SmallVector<Edge, 8> acyclicEdges;
     for (auto &inputEdge : inputEdges) {
-      auto it = std::find_if(
-          result.feedbackEdges.begin(), result.feedbackEdges.end(),
-          [&](const Edge &edge) {
-            return compareRegistersEqual(edge.first, inputEdge.first) &&
-                   compareRegistersEqual(edge.second, inputEdge.second);
-          });
+      auto it = std::find_if(result.feedbackEdges.begin(),
+                             result.feedbackEdges.end(), [&](const Edge &edge) {
+                               return edge.first == inputEdge.first &&
+                                      edge.second == inputEdge.second;
+                             });
       if (it == result.feedbackEdges.end()) {
         acyclicEdges.push_back(inputEdge);
-        acyclicNodes.insert(getBaseRegister(inputEdge.first));
-        acyclicNodes.insert(getBaseRegister(inputEdge.second));
+        acyclicNodes.insert(inputEdge.first.asBaseRegister());
+        acyclicNodes.insert(inputEdge.second.asBaseRegister());
       }
     }
 
@@ -477,20 +466,20 @@ struct FeedbackArcSet {
   }
 };
 
-SmallVector<std::pair<uint16_t, uint16_t>, 8>
+SmallVector<std::pair<Register, Register>, 8>
 RegisterAllocation::remapSuccessorRegisters(Operation *op, int successorIndex) {
   // Compute the initial directed graph of register movements.
   // This may contain cycles ([reg 0->1], [reg 1->0], ...) that would not be
   // possible to evaluate as a direct remapping.
-  SmallVector<std::pair<uint16_t, uint16_t>, 8> srcDstRegs;
+  SmallVector<std::pair<Register, Register>, 8> srcDstRegs;
   auto *targetBlock = op->getSuccessor(successorIndex);
   auto operands =
       cast<BranchOpInterface>(op).getSuccessorOperands(successorIndex);
   for (auto it : llvm::enumerate(*operands)) {
-    uint16_t srcReg = mapToRegister(it.value());
+    auto srcReg = mapToRegister(it.value());
     BlockArgument targetArg = targetBlock->getArgument(it.index());
-    uint16_t dstReg = mapToRegister(targetArg);
-    if (!compareRegistersEqual(srcReg, dstReg)) {
+    auto dstReg = mapToRegister(targetArg);
+    if (srcReg != dstReg) {
       srcDstRegs.push_back({srcReg, dstReg});
     }
   }
@@ -513,12 +502,13 @@ RegisterAllocation::remapSuccessorRegisters(Operation *op, int successorIndex) {
   int scratchI32Reg = maxI32RegisterOrdinal_;
   int scratchRefReg = maxRefRegisterOrdinal_;
   for (auto feedbackEdge : feedbackArcSet.feedbackEdges) {
-    uint16_t scratchReg;
-    if (isRefRegister(feedbackEdge.first)) {
-      scratchReg = ++scratchRefReg;
-      scratchReg |= kRefRegisterTypeBit;
+    Register scratchReg;
+    if (feedbackEdge.first.isRef()) {
+      scratchReg =
+          Register::getWithSameType(feedbackEdge.first, ++scratchRefReg);
     } else {
-      scratchReg = ++scratchI32Reg;
+      scratchReg =
+          Register::getWithSameType(feedbackEdge.first, ++scratchI32Reg);
     }
     feedbackArcSet.acyclicEdges.insert(feedbackArcSet.acyclicEdges.begin(),
                                        {feedbackEdge.first, scratchReg});
