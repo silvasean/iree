@@ -44,47 +44,25 @@ class FixedPointIteratorPass
 
   void runOnOperation() override;
 
-  Optional<OpPassManager> pipeline;
-
-  // Serialized form of the body pipeline.
-  Option<std::string> pipelineStr{
+  Option<OpPassManager> pipeline{
       *this, "pipeline", llvm::cl::desc("Pipeline to run to a fixed point")};
   Option<int> maxIterations{*this, "max-iterations",
                             llvm::cl::desc("Maximum number of iterations"),
                             llvm::cl::init(10)};
 };
 
-FixedPointIteratorPass::FixedPointIteratorPass(OpPassManager pipeline)
-    : pipeline(std::move(pipeline)) {
-  llvm::raw_string_ostream ss(pipelineStr);
-  this->pipeline->printAsTextualPipeline(ss);
-  ss.flush();
+FixedPointIteratorPass::FixedPointIteratorPass(OpPassManager pipeline) {
+  this->pipeline.setValue(pipeline);
 }
 
 LogicalResult FixedPointIteratorPass::initializeOptions(StringRef options) {
   if (failed(Pass::initializeOptions(options))) return failure();
-  if (pipeline) return success();
-
-  // Pipelines are expected to be of the form `<op-name>(<pipeline>)`.
-  // TODO: This was lifted from the Inliner pass. We should provide a parse
-  // entry point that is the direct inverse of printAsTextualPipeline() and
-  // at least keep this internal to the upstream implementation.
-  // See: https://github.com/llvm/llvm-project/issues/52813
-  StringRef pipelineSr = pipelineStr;
-  size_t pipelineStart = pipelineSr.find_first_of('(');
-  if (pipelineStart == StringRef::npos || !pipelineSr.consume_back(")"))
-    return failure();
-  StringRef opName = pipelineSr.take_front(pipelineStart);
-  OpPassManager pm(opName);
-  if (failed(parsePassPipeline(pipelineSr.drop_front(1 + pipelineStart), pm)))
-    return failure();
-  pipeline = std::move(pm);
   return success();
 }
 
 void FixedPointIteratorPass::getDependentDialects(
     DialectRegistry &registry) const {
-  pipeline->getDependentDialects(registry);
+  pipeline.getValue().getDependentDialects(registry);
 }
 
 void FixedPointIteratorPass::runOnOperation() {
@@ -103,7 +81,7 @@ void FixedPointIteratorPass::runOnOperation() {
     getOperation()->setAttr(markerName,
                             IntegerAttr::get(IndexType::get(context), i));
     getOperation()->removeAttr(modifiedName);
-    if (failed(runPipeline(*pipeline, getOperation()))) {
+    if (failed(runPipeline(pipeline.getValue(), getOperation()))) {
       return signalPassFailure();
     }
 
